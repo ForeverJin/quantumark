@@ -14,7 +14,7 @@
 - **三类任务**
   - 目录镜像：增量上传，可选"源端删除时云端也删"
   - 目录归档：每次运行打一个 `tar.zst`（可选 `age` 加密），保留最近 N 份
-  - MySQL / MariaDB 数据目录：把数据库的 datadir 当文件备份（打包归档或按文件镜像）
+  - MySQL / MariaDB：连库导出（默认，`mariadb-dump`，不锁表），或把 datadir 当文件备份（打包归档 / 按文件镜像）
 - **调度**：网页里选"每天 / 每周 / 每月 / 每小时 / 自定义 cron"，时间用时间选择器；支持停机后 24 小时内补跑一次
 - **运行记录**：每轮的统计与完整日志，可在网页里看；失败会带上原因
 - **上传校验**：大小 + SHA1（远端提供时）；先传临时名、校验通过再改成正式名，旧版本在此之前一直保留
@@ -23,28 +23,159 @@
 
 ## 快速开始
 
-前置：一台常开机器（Linux + Docker），以及一个**能访问到的 CD2**（同机或同网段都行）。
+前置：一台常开机器（Linux + Docker Compose v2），以及一个**能访问到的 CD2**（同机或同网段都行）。
+
+### 方式一：用现成镜像（推荐）
+
+镜像发布在 GitHub Container Registry，支持 `linux/amd64` / `linux/arm64`，可匿名拉取：
+
+```bash
+docker pull ghcr.io/foreverjin/quantumark:latest
+```
+
+新建一个部署目录（不需要克隆源码），写入 `docker-compose.yml`：
+
+```yaml
+services:
+  quantumark:
+    image: ghcr.io/foreverjin/quantumark:latest
+    container_name: quantumark
+    restart: unless-stopped
+    user: "1000:1000"                        # 与 ./data 的属主一致
+    environment:
+      QM_DATA_DIR: /data
+      QM_BIND: 0.0.0.0:8790
+      QM_ADMIN_PASSWORD: ""                   # 留空则首次启动打印设置码
+      QM_LOG: quantumark=info
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/data                          # 状态、密钥、日志
+      - /:/host:ro                            # 网页里可浏览/备份的宿主机目录
+      - ./inbox:/upload:rw                    # 可选：开启“上传后删除本地”时才需要，不用可删
+    ports:
+      - "8790:8790"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8790/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+```
+
+首次启动（`/data` 必须可写，且属主与 `user` 一致）：
+
+```bash
+mkdir -p data && sudo chown -R 1000:1000 data
+docker compose up -d
+docker compose logs -f      # 找“初始设置码”
+```
+
+打开 `http://<机器 IP>:8790`，然后按下面的「基本使用」配置。
+
+更新到最新镜像：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+### 方式二：从源码构建
 
 ```bash
 cd quantumark
 cp .env.example .env     # 按需改：端口、源目录、UID
 docker compose up -d --build
-docker compose logs -f   # 首次启动会打印"初始设置码"
+docker compose logs -f
 ```
 
-打开 `http://<机器 IP>:8790`：
+仓库里的 `docker-compose.yml` 已包含下面的完整配置，`.env` 里的 `QM_*` 会代入 compose 文件。
 
-1. 输入日志里的**初始设置码**，设置管理员密码（只需一次）。
-2. 「目的地」→ 新增：
-   - 地址：CD2 的地址，例如 `http://192.168.8.114:19798`
-   - 根路径：115 在 CD2 里的路径，例如 `/115open`
-   - API Token：在 CD2 网页的令牌管理里创建（权限见下）
-   - 保存后点**测试连接**，再点**自检**（会传一个 64 KiB 随机文件、读回比对、删掉）
-3. 「备份任务」→ 新建：
-   - 点「浏览」选源目录。宿主机根目录以只读方式挂在容器的 `/host`，
-     所以你想备份 `/vol1/1000/media` 就在浏览里选 `host → vol1 → 1000 → media`
-     （想缩小可读范围：`.env` 里设 `QM_HOST_ROOT=/vol1`，容器就只能看到 `/vol1`）
-   - 远端目录必须在目的地根路径之下，例如 `/115open/backup/media`
+## compose 部署配置说明
+
+| 配置 | 作用 | 注意 |
+| --- | --- | --- |
+| `user` | 容器运行用户 | 必须与 `./data` 的属主一致，否则 SQLite 打不开 |
+| `./data:/data` | SQLite、加密密钥、运行日志 | 迁移时整个目录一起搬；`secret.key` 丢了凭据要重填 |
+| `/:/host:ro` | 只读浏览宿主机目录 | 想缩小范围改成 `/vol1:/host:ro`，容器里就只看得到 `/vol1` |
+| `./inbox:/upload:rw` | 可写的“收件箱” | 只有开启“上传后删除本地”才需要，目录属主也要是运行用户；不用可删掉这行 |
+| `ports` | 网页端口 | 默认 `0.0.0.0:8790` 允许局域网访问；只本机访问改 `127.0.0.1:8790:8790` |
+| `read_only` + `tmpfs` | 根文件系统只读 | 程序只写 `/data`、`/upload`、`/tmp` |
+| `TZ` | 时区 | 影响 cron 触发时间和归档文件名 |
+| `cap_drop: ALL` | 去掉 Linux capabilities | 程序不需要任何特权 |
+
+几个易错点：
+
+- 容器**不以 root 运行**。`./data` 的 UID/GID 不是 1000 时，把 `user` 和 `chown` 一起改。
+- 宿主机路径是按**容器内路径**选的：备份 `/vol1/1000/media`，在网页浏览里选 `host → vol1 → 1000 → media`，不要填宿主机的绝对路径。
+- 不要把网页端口或 CD2 端口暴露到公网；令牌等同于密码，跨网段请用 VPN。
+
+## 基本使用
+
+### 1. 首次登录
+
+- `QM_ADMIN_PASSWORD` 留空：启动日志会打印一次性的**初始设置码**，打开网页输入它并设置密码。
+- 填了 `QM_ADMIN_PASSWORD`：直接用这个密码登录，要求至少 8 位。
+
+设置完成后设置码失效。忘记密码见「重置管理员密码」。
+
+### 2. 添加目的地
+
+「目的地」→ 新增，填：
+
+| 字段 | 示例 | 说明 |
+| --- | --- | --- |
+| 地址 | `http://192.168.8.114:19798` | CD2 的 gRPC 地址，带 `http://`，默认端口 19798 |
+| 根路径 | `/115open` | 115 在 CD2 里的路径；任务的远端目录必须位于它下面 |
+| API Token | `...` | 在 CD2 网页创建，权限见「CD2 令牌权限」 |
+
+保存后依次点 **测试连接**、**自检**。自检会上传一个 64 KiB 随机文件、读回比对 SHA1 再删掉，用来确认整条上传链路。
+
+不想手动建 Token，也可以填 CD2 的账号密码，点“用账号密码生成最小权限 Token”；账号密码只用于这一次调用，不保存。
+
+### 3. 新建任务
+
+「备份任务」→ 新建，选类型：
+
+| 类型 | 适合 | 远端产物 |
+| --- | --- | --- |
+| 目录镜像 | 照片、文档等需要“云端和本地一致”的目录 | 与原目录同结构的文件 |
+| 目录归档 | 需要留多个历史版本的目录 | 每次一个 `tar.zst[.age]`，保留最近 N 份 |
+| MySQL | 数据库备份；再选 mode：`dump` 连库导出（默认，运行中可用）/ `archive` 打包数据目录 / `mirror` 同步数据目录 | 每库一个 `*.sql.zst[.age]`，或数据目录的归档/文件镜像 |
+
+填写要点：
+
+- **源目录**：点「浏览」从 `/host` 里选（只读）。
+- **远端目录**：必须在目的地根路径之下，例如 `/115open/backup/media`。
+- **调度**：每天 / 每周 / 每月 / 每小时，或自定义 cron（5 段，时区跟随 `TZ`）。
+- **排除规则**：镜像任务支持 glob，默认排除常见的临时文件。
+- **加密**：归档/导出可选 `age` 公钥加密；私钥只显示一次，容器不保存，丢了无法解密。
+
+### 4. 运行与查看
+
+- **立即运行**：不等调度手动跑一次；运行中可点**停止**。
+- **预览**（仅镜像任务）：只计算会新增/修改/删除哪些文件，不上传、不删除。
+- **运行记录**：每轮的统计、错误原因和完整日志；失败时先看这里的最后几行。
+- 任务全局串行：前一个任务没结束，后一个会排队。
+
+### 5. 维护
+
+```bash
+# 更新镜像
+docker compose pull && docker compose up -d
+
+# 看日志
+docker compose logs -f quantumark
+```
+
+- `/data` 也要备份：它记录了“云端文件对应本地哪次修改”，丢了会触发重新认领（多一次列目录配额）。
+- 索引异常或想强制重新认领时，调用 `POST /api/jobs/<id>/reset-index`（网页暂无按钮，需登录会话），下次运行会重新读一次远端目录。
 
 ## 重置管理员密码
 
@@ -78,7 +209,7 @@ docker compose exec quantumark /usr/local/bin/quantumark --set-password 新密�
 
 - 以本地索引为准判断增删改，**不重复扫描云端目录**（列目录在 115 侧要计配额）。
 - 只有**索引为空**的首次运行会读一次云端备份目录，把内容一致的已有文件认领进来；之后不再读。
-  如果索引丢了，可以在任务上点"重置索引"，下次运行会重新认领。
+  如果索引丢了，需要重置索引（`POST /api/jobs/<id>/reset-index`），下次运行会重新认领。
 - **同步删除**默认关闭。开启后只删"索引里记录过、且本次源端不存在"的文件，删除会进 115 回收站。
 - **上传后删除本地**（移动式备份）默认关闭。开启后：上传并通过 SHA1 校验的文件会被删掉（或移到本地回收目录），
   本地不留存；本次跳过但索引里已有 SHA1 记录的旧文件也会一并清理。和"同步删除"互斥。
@@ -156,15 +287,28 @@ age -d -i key.txt media-20261125-030000.tar.zst.age | zstd -d | tar -xf - -C /pa
 
 ## 环境变量
 
+程序会读取的环境变量（`TZ` 由 chrono 使用）：
+
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `QM_DATA_DIR` | `/data` | 数据目录（SQLite、密钥、运行日志） |
-| `QM_HOST_ROOT` | `/` | 宿主机上挂到容器 `/host`（只读）的路径，决定网页里能选到哪些目录 |
-| `QM_UPLOAD_DIR` | `./data/empty-upload` | 宿主机上挂到容器 `/upload`（可写）的路径，"上传后删除本地"要用它 |
 | `QM_BIND` | `0.0.0.0:8790` | 网页监听地址 |
 | `QM_ADMIN_PASSWORD` | 空 | 首次启动的管理员密码；留空则打印一次性设置码 |
 | `QM_LOG` | `quantumark=info` | 日志级别（`RUST_LOG` 风格） |
 | `TZ` | 系统时区 | 定时任务与文件名使用这个时区 |
+
+`docker-compose.yml` / `.env` 里还会用到这些（由 compose 代入，程序本身不读）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `QM_HOST_ROOT` | `/` | 宿主机上挂到 `/host`（只读）的路径，决定网页里能选到哪些目录 |
+| `QM_UPLOAD_DIR` | `./data/empty-upload` | 宿主机上挂到 `/upload`（可写）的路径，“上传后删除本地”要用它 |
+| `QM_UID` / `QM_GID` | `1000` | 容器用户；`./data` 必须归它所有 |
+| `QM_PORT` / `QM_PUBLISH` | `8790` / `0.0.0.0` | 网页端口与绑定地址 |
+| `QM_TAG` | `0.1.0` | 本地构建的镜像标签 |
+| `BUILDER_BASE` / `RUNTIME_BASE` | `rust:1-bookworm` / `debian:bookworm-slim` | 构建用的基础镜像（被墙时可换镜像站） |
+| `CARGO_BUILD_JOBS` | `4` | 构建并行度 |
+| `CARGO_REGISTRY_MIRROR` | 空 | crates.io 镜像，例如 `sparse+https://rsproxy.cn/index/` |
 
 ## 数据与状态
 
@@ -175,20 +319,51 @@ age -d -i key.txt media-20261125-030000.tar.zst.age | zstd -d | tar -xf - -C /pa
 备份管理器自己的 `/data` 也值得备份——它记录了"云端哪个文件对应本地哪次修改"。
 你可以再建一个目录归档任务把 `/data` 打进去（注意其中含加密密钥）。
 
-## 构建
+## 镜像与构建
+
+### 现成镜像
+
+- 地址：`ghcr.io/foreverjin/quantumark`
+- 架构：`linux/amd64`、`linux/arm64`（多架构 manifest，`docker pull` 会自动选择）
+- 标签：
+
+| 标签 | 来源 |
+| --- | --- |
+| `latest`、`main` | `main` 分支最新提交 |
+| `sha-<短提交>` | 对应提交，便于回滚 |
+| `1.2.3` / `1.2` | 推送 `v1.2.3` 这类标签时生成 |
+
+回滚时把 compose 里的镜像固定到某个提交，再重新拉起：
+
+```yaml
+image: ghcr.io/foreverjin/quantumark:sha-abc1234
+```
 
 ```bash
-# 本机架构
+docker compose pull && docker compose up -d
+```
+
+### 本地构建
+
+```bash
+# 当前架构
 docker compose build
 
-# 交叉编译 arm64（编译阶段固定在构建机上跑，不需要 QEMU 模拟编译；
-# 但运行镜像里的 apt 安装需要目标架构能执行）
+# 交叉编译 arm64
 docker buildx build --platform linux/arm64 -t quantumark:0.1.0-arm64 --load .
 ```
 
-如果构建机没有注册 QEMU binfmt，arm64 的运行阶段会报 `exec format error`。
-两种办法：在目标机器上原生构建（`docker compose build`），或用
-`docker run --privileged --rm tonistiigi/binfmt --install arm64` 注册一次（会改动宿主机的 binfmt 配置）。
+arm64 的编译阶段在构建机上交叉完成，但 runtime 阶段安装 `mariadb-client` / `zstd` / `age` 需要能执行 arm64 二进制。
+构建机没注册 binfmt 时会报 `exec format error`：在目标机器上原生 `docker compose build`，
+或执行 `docker run --privileged --rm tonistiigi/binfmt --install arm64` 注册一次。
+
+### CI
+
+`.github/workflows/ci.yml`：
+
+- push 到 `main`、推送 `v*` 标签或手动触发：跑 `cargo test --locked`、`cargo build --release --locked`，
+  然后构建 amd64 + arm64 镜像并推送到 GHCR。
+- PR：只跑测试与构建，不推镜像。
 
 ## 已知限制
 
