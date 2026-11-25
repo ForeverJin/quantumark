@@ -200,6 +200,7 @@ fn initial_due(schedule: &Schedule, now_local: DateTime<Local>) -> DateTime<Loca
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn 五段表达式补秒位() {
@@ -211,29 +212,19 @@ mod tests {
 
     #[test]
     fn 标准星期编号换算正确() {
-        // 2026-11-25 是周三
-        let from = chrono::DateTime::parse_from_rfc3339("2026-11-25T16:00:00+08:00")
-            .unwrap()
-            .with_timezone(&Local);
+        // 2026-11-25 是周三。时间都用 Local 构造，结果不依赖运行机器的时区。
+        let at = |y, m, d, h| Local.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap();
+        let from = at(2026, 11, 25, 16);
         let cases = [
-            ("0 4 * * 1", "2026-11-26T04:00:00+08:00"),      // 周一 → 下一个周四? 不，1=周一，下一次是 11-30
-            ("0 4 * * 4", "2026-11-26T04:00:00+08:00"),      // 周四 → 11-26
-            ("0 4 * * 0", "2026-11-29T04:00:00+08:00"),      // 周日 → 11-29
-            ("0 4 * * 7", "2026-11-29T04:00:00+08:00"),      // 7 也当周日
-            ("0 4 * * 1-5", "2026-11-26T04:00:00+08:00"),    // 工作日 → 周四
+            ("0 4 * * 1", at(2026, 11, 30, 4)),   // 1=周一 → 11-30
+            ("0 4 * * 4", at(2026, 11, 26, 4)),   // 周四 → 11-26
+            ("0 4 * * 0", at(2026, 11, 29, 4)),   // 周日 → 11-29
+            ("0 4 * * 7", at(2026, 11, 29, 4)),   // 7 也当周日
+            ("0 4 * * 1-5", at(2026, 11, 26, 4)), // 工作日 → 周四
         ];
         for (expr, want) in cases {
             let schedule = parse(expr).unwrap();
             let next = schedule.after(&from).next().unwrap();
-            let want = chrono::DateTime::parse_from_rfc3339(want).unwrap().with_timezone(&Local);
-            if expr == "0 4 * * 1" {
-                // 周一：11-30 04:00
-                let monday = chrono::DateTime::parse_from_rfc3339("2026-11-30T04:00:00+08:00")
-                    .unwrap()
-                    .with_timezone(&Local);
-                assert_eq!(next, monday, "{expr}");
-                continue;
-            }
             assert_eq!(next, want, "{expr} 的下一次不符");
         }
     }
