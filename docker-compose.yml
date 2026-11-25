@@ -1,0 +1,59 @@
+# 备份管理器：网页配置、定时执行，把本地目录 / MySQL 转储经 CD2 上传到 115。
+#
+#   docker compose build
+#   docker compose up -d
+#   docker compose logs -f
+#
+# 约束：程序只调用 CD2 的 gRPC 接口，对 115 的读写都由 CD2 完成。
+# CD2 可以在本机，也可以在同网段的另一台机器上（在网页里填地址即可）。
+
+name: quantumark
+
+services:
+  quantumark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILDER_BASE: ${BUILDER_BASE:-rust:1-bookworm}
+        RUNTIME_BASE: ${RUNTIME_BASE:-debian:bookworm-slim}
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-4}
+        CARGO_REGISTRY_MIRROR: ${CARGO_REGISTRY_MIRROR:-}
+        QM_UID: ${QM_UID:-1000}
+        QM_GID: ${QM_GID:-1000}
+    image: quantumark:${QM_TAG:-0.1.0}
+    container_name: quantumark
+    restart: unless-stopped
+    user: "${QM_UID:-1000}:${QM_GID:-1000}"
+    environment:
+      QM_DATA_DIR: /data
+      QM_BIND: 0.0.0.0:8790
+      QM_LOG: ${QM_LOG:-quantumark=info}
+      QM_ADMIN_PASSWORD: ${QM_ADMIN_PASSWORD:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 状态、密钥、运行日志
+      - ./data:/data
+      # 宿主机根目录以只读方式挂到 /host：任务里的路径在网页里浏览选择，
+      # 不用再改 .env 重启（容器内无法动态挂载，所以这里挂大一点）。
+      - ${QM_HOST_ROOT:-/}:/host:ro
+      # 可写的“收件箱”：要给任务开“上传后删除本地”时，源目录必须可写，
+      # 把这类目录挂到这里（默认指向项目下的空目录，没用到时无副作用）。
+      - ${QM_UPLOAD_DIR:-./data/empty-upload}:/upload:rw
+    ports:
+      # 默认允许局域网访问（网页要能从别的机器打开）；只想本机访问改成 127.0.0.1
+      - "${QM_PUBLISH:-0.0.0.0}:${QM_PORT:-8790}:8790"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8790/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
