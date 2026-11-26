@@ -5,7 +5,7 @@
 #   - 推送 v* 标签：测试通过后构建 Release 二进制，并推送 amd64 + arm64 镜像
 #   - 手动触发：走标签的构建流程，镜像只打 sha-<commit>
 #
-# 镜像标签（tag 触发）：1.2.3 / 1.2 / 1 / sha-<commit> / latest
+# 镜像标签（tag 触发）：latest / sha-<commit>，不打版本号标签
 # 镜像位置：ghcr.io/<owner>/quantumark，使用仓库自带的 GITHUB_TOKEN，无需额外密钥。
 # 首次推送后包默认是私有的，需要在仓库的 Packages 页面按需改成 public。
 
@@ -89,11 +89,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             type=sha,format=short
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest
 
       - name: 构建并推送
         uses: docker/build-push-action@v6

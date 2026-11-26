@@ -329,9 +329,8 @@ age -d -i key.txt media-20261125-030000.tar.zst.age | zstd -d | tar -xf - -C /pa
 
 | 标签 | 来源 |
 | --- | --- |
-| `latest` | 最近一次 `v*` 标签构建 |
-| `1.2.3` / `1.2` / `1` | 推送 `v1.2.3` 这类标签时生成 |
-| `sha-<短提交>` | 对应提交（标签或手动触发），便于回滚 |
+| `latest` | 最近一次构建（标签或手动触发） |
+| `sha-<短提交>` | 对应提交，便于回滚（不发布版本号标签） |
 
 回滚时把 compose 里的镜像固定到某个提交，再重新拉起：
 
@@ -362,8 +361,8 @@ arm64 的编译阶段在构建机上交叉完成，但 runtime 阶段安装 `mar
 `.github/workflows/ci.yml`：
 
 - push 到 `main` / PR：只跑 `cargo test --locked`，不构建 Release、不推镜像。
-- 推送 `v*` 标签：测试通过后构建 Release 二进制，并推送 amd64 + arm64 镜像（版本号 / `sha-*` / `latest`）。
-- 手动触发：走标签的构建流程，镜像只打 `sha-*`。
+- 推送 `v*` 标签：测试通过后构建 Release 二进制，并推送 amd64 + arm64 镜像（`sha-*` / `latest`）。
+- 手动触发：走标签的构建流程，镜像打 `sha-*` / `latest`。
 
 ## 已知限制
 
