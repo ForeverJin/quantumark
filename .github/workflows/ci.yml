@@ -105,5 +105,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             CARGO_BUILD_JOBS=4
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # scope 显式指定：构建被中途取消时可能留下损坏的 registry 缓存，
+          # 换一个 scope（v2 → v3 …）即可让下一次构建从干净缓存开始。
+          cache-from: type=gha,scope=quantumark-v2
+          cache-to: type=gha,mode=max,scope=quantumark-v2
