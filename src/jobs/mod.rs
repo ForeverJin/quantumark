@@ -301,36 +301,14 @@ impl RemoteDirCache {
     }
 }
 
-/// 计算本地文件的 SHA1（用于首次认领时和远端比对）。
-pub async fn local_sha1(path: &Path) -> Result<String, String> {
-    use sha1::{Digest, Sha1};
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| format!("打开 {} 失败: {e}", path.display()))?;
-    let mut hasher = Sha1::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .await
-            .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// 生成索引行。
-pub fn index_row(job_id: i64, rel: &str, size: i64, mtime_ns: i64, sha1: Option<String>, remote_path: &str) -> FileRow {
+/// 生成索引行。索引不再计算/保存 SHA1。
+pub fn index_row(job_id: i64, rel: &str, size: i64, mtime_ns: i64, remote_path: &str) -> FileRow {
     FileRow {
         job_id,
         rel: rel.to_string(),
         size,
         mtime_ns,
-        sha1,
+        sha1: None,
         remote_path: remote_path.to_string(),
         updated_at: now(),
     }

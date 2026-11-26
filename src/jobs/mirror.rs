@@ -15,7 +15,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use super::{
     LocalFile, RemoteDirCache, RunAbort, RunCtx, cleanup_pending, ensure_dir_cached,
-    index_row, local_sha1, register_failure, remote_path_of, scan_local,
+    index_row, register_failure, remote_path_of, scan_local,
 };
 use crate::destination::{
     DestError, Destination, RemoteEntry, UploadRequest, join_path, split_path,
@@ -74,14 +74,14 @@ pub async fn run(
 
     let mut candidates: Vec<LocalFile> = Vec::new();
     let mut skipped: u64 = 0;
-    // 本次不需要上传、但云端已有确认记录（带 SHA1）的文件：开了删本地时可以直接清
+    // 本次不需要上传、但索引里已有确认记录的文件：开了删本地时可以直接清
     let mut already_in_cloud: Vec<LocalFile> = Vec::new();
     for f in &scan.files {
         let expected = remote_path_of(remote_dir, &f.rel);
         match index.get(&f.rel) {
             Some(row) if row.size == f.size && row.mtime_ns == f.mtime_ns && row.remote_path == expected => {
                 skipped += 1;
-                if opts.delete_local && row.sha1.is_some() {
+                if opts.delete_local {
                     already_in_cloud.push(f.clone());
                 }
             }
@@ -105,7 +105,7 @@ pub async fn run(
     let first_run = index.is_empty() && !opts.skip_adopt;
     let mut replaced: HashSet<String> = HashSet::new();
     if first_run && !candidates.is_empty() {
-        ctx.info("索引为空：先读一次云端备份目录，认领内容一致的文件（只做这一次，之后不再读远端目录）");
+        ctx.info("索引为空：先读一次云端备份目录，按大小认领文件（只做这一次，之后不再读远端目录）");
         match adopt(ctx, dest, remote_dir).await {
             Ok(remote) => {
                 let mut remain = Vec::new();
@@ -113,51 +113,17 @@ pub async fn run(
                     let target = remote_path_of(remote_dir, &f.rel);
                     match remote.get(&f.rel) {
                         Some(entry) if !entry.is_dir && entry.size == f.size => {
-                            match local_sha1(Path::new(&f.abs)).await {
-                                Ok(sha) => {
-                                    let remote_sha = entry.sha1.as_ref().map(|s| s.to_lowercase());
-                                    if remote_sha.as_deref() == Some(sha.as_str()) {
-                                        store
-                                            .upsert_file(&index_row(
-                                                job_id,
-                                                &f.rel,
-                                                f.size,
-                                                f.mtime_ns,
-                                                Some(sha),
-                                                &target,
-                                            ))
-                                            .map_err(RunAbort::Error)?;
-                                        ctx.with_stats(|s| s.adopted += 1);
-                                        continue;
-                                    }
-                                    if remote_sha.is_none() {
-                                        ctx.warn(format!(
-                                            "{}: 远端没有 SHA1，按大小认领",
-                                            f.rel
-                                        ));
-                                        store
-                                            .upsert_file(&index_row(
-                                                job_id,
-                                                &f.rel,
-                                                f.size,
-                                                f.mtime_ns,
-                                                Some(sha),
-                                                &target,
-                                            ))
-                                            .map_err(RunAbort::Error)?;
-                                        ctx.with_stats(|s| s.adopted += 1);
-                                        continue;
-                                    }
-                                    // 内容不同：需要重传（旧版本保留到新版校验通过）
-                                    replaced.insert(f.rel.clone());
-                                    remain.push(f);
-                                }
-                                Err(e) => {
-                                    ctx.warn(format!("{}: 计算本地 SHA1 失败（{e}），改为重传", f.rel));
-                                    replace_entry(&mut replaced, &f.rel);
-                                    remain.push(f);
-                                }
-                            }
+                            // 不计算本地 SHA1，按大小认领；同大小但内容不同的文件也会被认领
+                            store
+                                .upsert_file(&index_row(
+                                    job_id,
+                                    &f.rel,
+                                    f.size,
+                                    f.mtime_ns,
+                                    &target,
+                                ))
+                                .map_err(RunAbort::Error)?;
+                            ctx.with_stats(|s| s.adopted += 1);
                         }
                         Some(_) => {
                             // 远端同名但大小不同
@@ -214,7 +180,6 @@ pub async fn run(
                         &f.rel,
                         out.size,
                         f.mtime_ns,
-                        out.sha1.clone(),
                         &dst,
                     ))
                     .map_err(RunAbort::Error)?;
@@ -222,12 +187,7 @@ pub async fn run(
                     s.uploaded += 1;
                     s.uploaded_bytes += out.size.max(0) as u64;
                 });
-                ctx.info(format!(
-                    "已上传 {}（{}，{}）",
-                    f.rel,
-                    human(out.size.max(0) as u64),
-                    if out.sha1_verified { "SHA1 已核对" } else { "远端未提供 SHA1" }
-                ));
+                ctx.info(format!("已上传 {}（{}）", f.rel, human(out.size.max(0) as u64)));
                 if opts.delete_local {
                     remove_local(ctx, opts, Path::new(&opts.source), f);
                 }
@@ -348,10 +308,6 @@ pub async fn preview(
         first_run: index.is_empty(),
         sample,
     })
-}
-
-fn replace_entry(set: &mut HashSet<String>, rel: &str) {
-    set.insert(rel.to_string());
 }
 
 /// 删除（或移到回收目录）一个已确认在云端的本地文件。
@@ -678,7 +634,7 @@ mod tests {
         o.sync_delete = true;
         // 索引里先记一条，模拟之前备份过
         store
-            .upsert_file(&index_row(1, "keep.txt", 4, 0, None, "/115open/backup/keep.txt"))
+            .upsert_file(&index_row(1, "keep.txt", 4, 0, "/115open/backup/keep.txt"))
             .unwrap();
 
         let (ctx, _log) = test_ctx(fast_policy());
@@ -808,7 +764,7 @@ mod tests {
         run(&ctx1, &dest, &store, 1, "/115open/backup", &o1).await.unwrap();
         assert!(src.path().join("a.txt").exists());
 
-        // 第二次打开删本地：文件未变化，但索引里有 SHA1 → 直接清本地
+        // 第二次打开删本地：文件未变化，但索引里有记录 → 直接清本地
         let mut o2 = opts(src.path().to_str().unwrap());
         o2.delete_local = true;
         let (ctx2, _l2) = test_ctx(fast_policy());

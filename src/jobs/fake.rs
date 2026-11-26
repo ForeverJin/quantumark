@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sha1::{Digest, Sha1};
 use tokio::io::AsyncReadExt;
 
 use crate::destination::{
@@ -119,7 +118,7 @@ impl Destination for FakeDest {
                     name: split_path(p).1,
                     is_dir: false,
                     size: content.len() as i64,
-                    sha1: Some(sha1_hex(content)),
+                    sha1: None,
                     write_time: None,
                 });
             }
@@ -144,7 +143,7 @@ impl Destination for FakeDest {
                 name: split_path(path).1,
                 is_dir: false,
                 size: content.len() as i64,
-                sha1: Some(sha1_hex(content)),
+                sha1: None,
                 write_time: None,
             }));
         }
@@ -190,7 +189,6 @@ impl Destination for FakeDest {
         }
         let (dir, _) = split_path(req.dst_path);
         self.ensure_parents(&dir);
-        let sha1 = sha1_hex(&content);
         self.files
             .lock()
             .unwrap()
@@ -198,8 +196,6 @@ impl Destination for FakeDest {
         self.uploads.lock().unwrap().push(req.dst_path.to_string());
         Ok(UploadOutcome {
             size: content.len() as i64,
-            sha1: Some(sha1),
-            sha1_verified: true,
         })
     }
 
@@ -234,10 +230,6 @@ impl Destination for FakeDest {
             None => Err(DestError::NotFound(path.to_string())),
         }
     }
-}
-
-pub fn sha1_hex(data: &[u8]) -> String {
-    hex::encode(Sha1::digest(data))
 }
 
 /// 测试用的运行上下文：日志写到临时文件。

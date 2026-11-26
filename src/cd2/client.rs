@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use sha1::{Digest, Sha1};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -581,7 +580,7 @@ impl Cd2Client {
             .collect())
     }
 
-    /// 把数据流写给一个已创建的句柄。返回 (已发送字节, 本地算出的 SHA1)。
+    /// 把数据流写给一个已创建的句柄。返回已发送字节数。
     ///
     /// 只负责「写」：是否传完由调用方用 upload_tasks / stat 判断。
     pub async fn write_stream(
@@ -591,24 +590,22 @@ impl Cd2Client {
         upload_immediately: bool,
         progress: Arc<AtomicU64>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
-    ) -> Result<(u64, String), Cd2Error> {
+    ) -> Result<u64, Cd2Error> {
         self.prepare().await?;
 
         let (tx, rx) = mpsc::channel::<pb::WriteFileRequest>(4);
         let feeder = tokio::spawn(async move {
             let mut buf = vec![0u8; CHUNK_BYTES];
             let mut pos: u64 = 0;
-            let mut hasher = Sha1::new();
             loop {
                 if cancel.load(Ordering::Relaxed) {
-                    return Err::<(u64, String), Cd2Error>(Cd2Error::Other("上传已取消".to_string()));
+                    return Err::<u64, Cd2Error>(Cd2Error::Other("上传已取消".to_string()));
                 }
                 let n = match src.read(&mut buf).await {
                     Ok(n) => n,
                     Err(e) => return Err(Cd2Error::Other(format!("读源数据失败: {e}"))),
                 };
                 let last = n == 0;
-                hasher.update(&buf[..n]);
                 let req = pb::WriteFileRequest {
                     file_handle: handle,
                     start_pos: pos,
@@ -626,7 +623,7 @@ impl Cd2Client {
                     break;
                 }
             }
-            Ok((pos, hex::encode(hasher.finalize())))
+            Ok(pos)
         });
 
         let mut stub = self.stub.clone();
@@ -639,14 +636,14 @@ impl Cd2Client {
             Ok(r) => r.into_inner(),
             Err(status) => return Err(Cd2Error::from_status(status)),
         };
-        let (sent, sha1) = fed?;
+        let sent = fed?;
         if result.bytes_written != sent {
             return Err(Cd2Error::Other(format!(
                 "写入字节数不一致：本地 {sent}，CD2 回报 {}",
                 result.bytes_written
             )));
         }
-        Ok((sent, sha1))
+        Ok(sent)
     }
 
     // ---------- 便捷封装 ----------

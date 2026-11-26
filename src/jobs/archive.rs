@@ -148,7 +148,7 @@ pub async fn run(
             Ok(()) => {
                 store.remove_pending(pending_id).ok();
                 store
-                    .add_archive(job_id, &dst, out.size, out.sha1.as_deref())
+                    .add_archive(job_id, &dst, out.size, None)
                     .map_err(RunAbort::Error)?;
                 ctx.with_stats(|s| {
                     s.uploaded += 1;

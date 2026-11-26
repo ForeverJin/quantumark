@@ -156,9 +156,6 @@ pub struct UploadRequest<'a> {
 #[derive(Debug, Clone)]
 pub struct UploadOutcome {
     pub size: i64,
-    pub sha1: Option<String>,
-    /// 远端 SHA1 与本地算出的一致（远端没给 SHA1 时为 false）
-    pub sha1_verified: bool,
 }
 
 /// 目的地。

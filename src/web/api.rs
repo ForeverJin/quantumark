@@ -449,7 +449,7 @@ fn rec(steps: &mut Vec<Value>, ok: bool, name: &str, detail: impl Into<String>) 
 /// 自检：往 <根路径>/_selftest 上传一个随机小文件，读回比对，再删掉。
 ///
 /// 覆盖的链路：建立目录 → 流式上传（CD2 收数据后自己传 115）→ 等上传完成 →
-/// 定点查询大小和 SHA1 → 经 CD2 的下载地址读回比对 → 删除。
+/// 定点查询大小 → 经 CD2 的下载地址读回比对 → 删除。
 pub async fn selftest_destination(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -485,10 +485,6 @@ async fn run_selftest(dest: &Cd2Destination, dir: &str, steps: &mut Vec<Value>) 
     // 2. 准备随机内容
     let mut payload = vec![0u8; 64 * 1024];
     rand::fill(&mut payload[..]);
-    let sha1 = {
-        use sha1::Digest;
-        hex::encode(sha1::Sha1::digest(&payload))
-    };
     let name = format!(
         "selftest-{}.bin",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
@@ -496,7 +492,7 @@ async fn run_selftest(dest: &Cd2Destination, dir: &str, steps: &mut Vec<Value>) 
     let dst = crate::destination::join_path(dir, &name);
     let len = payload.len() as u64;
 
-    // 3. 上传（含等待 CD2 传到 115、大小与 SHA1 校验、临时名转正）
+    // 3. 上传（含等待 CD2 传到 115、大小校验、临时名转正）
     let outcome = dest
         .upload(crate::destination::UploadRequest {
             dst_path: &dst,
@@ -512,7 +508,7 @@ async fn run_selftest(dest: &Cd2Destination, dir: &str, steps: &mut Vec<Value>) 
             steps,
             true,
             "上传并等 CD2 传到 115",
-            format!("{} 字节，SHA1 已核对: {}", out.size, out.sha1_verified),
+            format!("{} 字节", out.size),
         ),
         Err(e) => {
             rec(steps, false, "上传并等 CD2 传到 115", e.to_string());
@@ -524,25 +520,11 @@ async fn run_selftest(dest: &Cd2Destination, dir: &str, steps: &mut Vec<Value>) 
     match dest.stat(&dst).await {
         Ok(Some(entry)) => {
             let size_ok = entry.size.max(0) as u64 == len;
-            let sha_ok = entry
-                .sha1
-                .as_deref()
-                .map(|s| s.eq_ignore_ascii_case(&sha1))
-                .unwrap_or(false);
             rec(
                 steps,
                 size_ok,
                 "查询远端大小",
                 format!("远端 {} 字节，本地 {} 字节", entry.size, len),
-            );
-            rec(
-                steps,
-                sha_ok || entry.sha1.is_none(),
-                "比对远端 SHA1",
-                match &entry.sha1 {
-                    Some(s) => format!("远端 {s}，本地 {sha1}"),
-                    None => "远端未提供 SHA1（115 通常会给，缺失不影响备份）".to_string(),
-                },
             );
         }
         Ok(None) => rec(steps, false, "查询远端大小", "上传完成后查不到该文件"),

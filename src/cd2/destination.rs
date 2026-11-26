@@ -2,7 +2,7 @@
 //
 // 上传流程（关键设计）：
 //   1. 先在云端建 <名字>.bmpart 临时文件并写入数据，由 CD2 负责上传到 115；
-//   2. 等 CD2 的上传任务到终态，再查文件大小和 SHA1 校验；
+//   2. 等 CD2 的上传任务到终态，核对大小；
 //   3. 校验通过后才改成正式名（旧版本在此之前一直保留）。
 //   这样既不依赖 CD2 对同名文件的处理策略，也不会出现「新版没传完、旧版已删除」。
 
@@ -54,7 +54,7 @@ impl Cd2Destination {
         temp_path: &str,
         expected_len: u64,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<UploadState, DestError> {
+    ) -> Result<(UploadState, Option<u64>), DestError> {
         let wait_budget = Duration::from_secs(600)
             + Duration::from_secs(expected_len / MIN_SPEED_BYTES_PER_SEC);
         let deadline = Instant::now() + wait_budget.min(Duration::from_secs(24 * 3600));
@@ -63,6 +63,10 @@ impl Cd2Destination {
         // 查的是 CD2 本地的任务列表，不走 115，代价很小。
         let mut interval = Duration::from_millis(300);
         let mut last_note = String::new();
+        let started = Instant::now();
+        // 任务列表刚创建时可能还是空的；先给 CD2 一点时间建任务，
+        // 避免每个文件都立刻多发一次 FindFileByPath（列查询在 115 侧可能计配额）。
+        let find_grace = Duration::from_secs(1);
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -79,7 +83,7 @@ impl Cd2Destination {
                 }
                 Err(e) => return Err(e.into_dest()),
             };
-            let mut terminal: Option<UploadState> = None;
+            let mut terminal: Option<(UploadState, Option<u64>)> = None;
             let mut last_error = String::new();
             for task in &tasks {
                 match Cd2Client::task_state(task) {
@@ -97,13 +101,13 @@ impl Cd2Destination {
                         };
                     }
                     state @ (UploadState::Finished | UploadState::Skipped) => {
-                        terminal = Some(state);
+                        terminal = Some((state, Some(task.size)));
                     }
                     UploadState::Running => {}
                 }
             }
-            if let Some(state) = terminal {
-                return Ok(state);
+            if let Some(done) = terminal {
+                return Ok(done);
             }
             if !last_error.is_empty() && tasks.iter().all(|t| {
                 matches!(
@@ -115,10 +119,10 @@ impl Cd2Destination {
             }
 
             // 任务列表里查不到（秒传完成得很快，任务被清掉）时，用定点查询确认文件已完整
-            if tasks.is_empty() {
+            if tasks.is_empty() && started.elapsed() >= find_grace {
                 if let Some(entry) = self.client.find(temp_path).await.map_err(|e| e.into_dest())? {
                     if entry.size.max(0) as u64 == expected_len {
-                        return Ok(UploadState::Finished);
+                        return Ok((UploadState::Finished, Some(entry.size.max(0) as u64)));
                     }
                 }
             }
@@ -157,46 +161,41 @@ impl Cd2Destination {
         dst_path: &str,
         expect_existing: bool,
         sent: u64,
-        local_sha1: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<UploadOutcome, DestError> {
-        // 等 CD2 传到 115
-        self.wait_upload_done(temp_path, sent, cancel).await?;
+        // 等 CD2 传到 115，同时拿到上传任务回报的最终大小
+        let (state, remote_size) = self.wait_upload_done(temp_path, sent, cancel).await?;
 
-        // 校验大小与 SHA1
-        let entry = self
-            .client
-            .find(temp_path)
-            .await
-            .map_err(|e| e.into_dest())?
-            .ok_or_else(|| DestError::Transient(format!("上传完成后找不到临时文件: {temp_path}")))?;
-        if entry.size.max(0) as u64 != sent {
-            return Err(DestError::Transient(format!(
-                "大小校验不通过：本地 {sent}，远端 {}",
-                entry.size
-            )));
-        }
-        let remote_sha1 = entry.file_hashes.get(&super::client::HASH_KEY_SHA1).cloned();
-        let sha1_verified = match &remote_sha1 {
-            Some(r) => {
-                if !r.eq_ignore_ascii_case(local_sha1) {
-                    return Err(DestError::Transient(format!(
-                        "SHA1 校验不通过：本地 {local_sha1}，远端 {r}"
-                    )));
-                }
-                true
+        // 任务没给出可靠的大小（0 与非空文件不匹配）或任务是 Skipped 时，才补一次定点查询。
+        let size_unknown = remote_size.map(|s| s == 0 && sent > 0).unwrap_or(true);
+        if size_unknown || matches!(state, UploadState::Skipped) {
+            let entry = self
+                .client
+                .find(temp_path)
+                .await
+                .map_err(|e| e.into_dest())?
+                .ok_or_else(|| {
+                    DestError::Transient(format!("上传完成后找不到临时文件: {temp_path}"))
+                })?;
+            if entry.size.max(0) as u64 != sent {
+                return Err(DestError::Transient(format!(
+                    "大小校验不通过：本地 {sent}，远端 {}",
+                    entry.size
+                )));
             }
-            None => false,
-        };
+        } else if let Some(size) = remote_size {
+            // 正常情况下只信上传任务回报的大小，不再发 FindFileByPath
+            if size != sent {
+                return Err(DestError::Transient(format!(
+                    "大小校验不通过：本地 {sent}，上传任务回报 {size}"
+                )));
+            }
+        }
 
         // 发布正式名
-        self.publish(temp_path, dst_path, expect_existing, sent, local_sha1).await?;
+        self.publish(temp_path, dst_path, expect_existing, sent).await?;
 
-        Ok(UploadOutcome {
-            size: sent as i64,
-            sha1: Some(local_sha1.to_string()),
-            sha1_verified,
-        })
+        Ok(UploadOutcome { size: sent as i64 })
     }
 
     /// 发布：把临时文件改成正式名。必要时先删旧版本。
@@ -206,7 +205,6 @@ impl Cd2Destination {
         dst_path: &str,
         expect_existing: bool,
         size: u64,
-        local_sha1: &str,
     ) -> Result<(), DestError> {
         let (dir, name) = split_path(dst_path);
         if expect_existing {
@@ -219,15 +217,9 @@ impl Cd2Destination {
             Ok(()) => Ok(()),
             Err(e) => {
                 // 目标已存在（expect_existing 判断有误，或并发）：
-                // 若内容一致就认领，否则删掉再改名一次。
+                // 大小一致就认领，否则删掉再改名一次。
                 if let Some(entry) = self.client.find(&join_path(&dir, &name)).await.map_err(|e| e.into_dest())? {
-                    let same_size = entry.size.max(0) as u64 == size;
-                    let same_sha1 = entry
-                        .file_hashes
-                        .get(&super::client::HASH_KEY_SHA1)
-                        .map(|s| s.eq_ignore_ascii_case(local_sha1))
-                        .unwrap_or(false);
-                    if same_size && (same_sha1 || entry.file_hashes.is_empty()) {
+                    if entry.size.max(0) as u64 == size {
                         self.client.delete(temp_path).await.map_err(|e| e.into_dest())?;
                         return Ok(());
                     }
@@ -365,8 +357,8 @@ impl Destination for Cd2Destination {
             Err(e) => return Err(e.into_dest()),
         };
 
-        // 2. 写数据（本地 SHA1 在这里顺带算出来）
-        let (sent, local_sha1) = self
+        // 2. 写数据
+        let sent = self
             .client
             .write_stream(
                 handle,
@@ -389,7 +381,7 @@ impl Destination for Cd2Destination {
 
         // 3~5 步包起来：任何失败都清理临时文件（风控命中时不再发请求）
         let result = self
-            .finish_upload(&temp_path, req.dst_path, req.expect_existing, sent, &local_sha1, &req.cancel)
+            .finish_upload(&temp_path, req.dst_path, req.expect_existing, sent, &req.cancel)
             .await;
         if let Err(e) = &result {
             if !matches!(e, DestError::RiskControl(_)) {

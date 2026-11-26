@@ -21,7 +21,7 @@ services:
         CARGO_REGISTRY_MIRROR: ${CARGO_REGISTRY_MIRROR:-}
         QM_UID: ${QM_UID:-1000}
         QM_GID: ${QM_GID:-1000}
-    image: quantumark:${QM_TAG:-0.1.0}
+    image: quantumark:${QM_TAG:-0.1.1}
     container_name: quantumark
     restart: unless-stopped
     user: "${QM_UID:-1000}:${QM_GID:-1000}"
