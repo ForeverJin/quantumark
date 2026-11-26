@@ -48,8 +48,8 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 WORKDIR /build
 COPY . .
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
     RUST_TARGET="$(cat /rust-target)" \
     && cargo build --locked --release --target "$RUST_TARGET" --bin quantumark \
     && install -Dm0755 "target/${RUST_TARGET}/release/quantumark" /usr/local/bin/quantumark
