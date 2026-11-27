@@ -30,6 +30,9 @@
   - 脚本自身、`.DS_Store`、`._*`、`*.tmp/*.part` 等默认直接跳过，不占 SMB 往返；
     服务端本来也会排除这些。
   - 目标目录是队列，不是存储：服务端上传成功后会删掉文件，不要手工清理/搬动。
+  - 源端删除的文件会写进共享里的 `.qm-delete` 标记（路径列表）；服务端下一轮会删掉
+    115 上对应的文件并清索引。只对“清单里记过、已经发送过”的文件生效；第一次全量
+    或 --full 不会产生删除。
   - 只按大小 + mtime 判断变化，必须保留源文件的 mtime（本脚本会保留）。
   - 改了 --dest / --src / --client / --subdir 都会被当成新目标，重新全量发送一次
     （服务端会按大小+mtime 去重，不会重复上传）；同一客户端可以推多个目录，
@@ -64,10 +67,12 @@ CLIENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 TOOL_FILES = {"qm_push.py", "qm_push.ps1", "qm_push.command", "qm_push.cmd"}
 SKIP_FILES = {".DS_Store", "Thumbs.db"}
 SKIP_DIRS = {"@eaDir", "#recycle", ".stfolder"}
+# 删除标记：客户端写给服务端的“这些文件已从源端删除”，服务端处理完会删掉它
+TOMBSTONE = ".qm-delete"
 
 
 def is_ignored(name: str) -> bool:
-    if name in TOOL_FILES or name in SKIP_FILES:
+    if name in TOOL_FILES or name in SKIP_FILES or name == TOMBSTONE:
         return True
     if name.startswith("._") or name.startswith(".Trash"):
         return True
@@ -125,6 +130,40 @@ def save_manifest(path: str, layouts: dict) -> None:
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"version": MANIFEST_VERSION, "layouts": layouts}, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_pending(base: str) -> set[str]:
+    """读取共享里的删除标记（还可能包含上一轮没被服务端处理掉的路径）。"""
+    path = os.path.join(base, TOMBSTONE)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError) as exc:
+        log(f"警告: 读取删除标记失败，按空处理: {exc}")
+        return set()
+    if isinstance(data, str):
+        data = [data]
+    if not isinstance(data, list):
+        return set()
+    return {x for x in data if isinstance(x, str) and x}
+
+
+def save_pending(base: str, pending: set[str]) -> None:
+    path = os.path.join(base, TOMBSTONE)
+    if not pending:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sorted(pending), f, ensure_ascii=False)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
@@ -364,6 +403,7 @@ def main() -> int:
     files = dict(old)
     layouts[layout] = files
     seen = set()
+    pending = load_pending(base)
 
     total = sent = skipped = adopted = adopted_fixed = failed = 0
     sent_bytes = 0
@@ -374,6 +414,7 @@ def main() -> int:
             continue
         total += 1
         seen.add(rel)
+        pending.discard(rel)  # 文件又回来了：取消之前的删除
         try:
             st = os.stat(abs_path)
         except OSError as exc:
@@ -440,8 +481,8 @@ def main() -> int:
                     failed += 1
                     if exc.errno in (errno.EIO, errno.ENOSPC, errno.ENOTCONN):
                         log(f"错误: 写入 {rel} 失败，可能 SMB 断开或磁盘满: {exc}")
-                        for pending in futures:
-                            pending.cancel()
+                        for fut in futures:
+                            fut.cancel()
                         break
                     log(f"错误: 写入 {rel} 失败: {exc}")
                     continue
@@ -453,10 +494,40 @@ def main() -> int:
                 if sent % SAVE_EVERY == 0:
                     save_manifest(manifest_path, layouts)
 
-    # 只清理当前布局里源端已删除的条目；同一客户端其他目录的清单保持不动
-    for rel in list(files):
-        if rel not in seen:
-            del files[rel]
+    # 删除：清单里记过、本次源端没看到的文件 → 写删除标记，服务端下一轮删云端
+    deleted = [rel for rel in files if rel not in seen]
+    if deleted:
+        for rel in deleted:
+            pending.add(rel)
+            if args.dry_run:
+                log(f"[dry-run] 将删除云端 {rel}")
+                continue
+            # 顺手删掉共享里还没上传的副本，免得服务端先传再删
+            target = os.path.join(base, *rel.split("/"))
+            try:
+                os.unlink(target)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log(f"警告: 删除共享副本 {rel} 失败: {exc}")
+        if args.dry_run:
+            log(f"检测到 {len(deleted)} 个文件已删除（dry-run，不写标记）")
+        else:
+            log(f"检测到 {len(deleted)} 个文件已删除，写入删除标记")
+
+    marker_ok = True
+    if not args.dry_run:
+        try:
+            save_pending(base, pending)
+        except OSError as exc:
+            marker_ok = False
+            failed += 1
+            log(f"错误: 写删除标记失败（{base}）: {exc}")
+
+    if marker_ok:
+        # 删除请求已经落到共享里，清单可以安全地删掉这些条目
+        for rel in deleted:
+            files.pop(rel, None)
 
     if not args.dry_run:
         try:

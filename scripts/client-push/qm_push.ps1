@@ -27,6 +27,9 @@
   一次脚本（首次运行会自动认领，也可以显式加 -Adopt）。大小 + mtime（1 秒容差）
   一致的文件直接记入清单，不会重抄；之后正常增量。
 
+  源端删除的文件会写进共享里的 .qm-delete 标记，服务端下一轮删掉 115 对应文件并清
+  索引；只对清单里记过、已经发送过的文件生效，-Full 不产生删除。
+
 .EXAMPLE
   .\qm_push.ps1 -Source D:\photos -Dest \\armbian\quantumark-inbox -Client mypc
 
@@ -65,6 +68,7 @@ $ErrorActionPreference = "Stop"
 $ManifestVersion = 2
 $ChunkSize = 4MB
 $SaveEvery = 20
+$Tombstone = '.qm-delete'
 
 function Write-Log([string]$Message) {
     Write-Host ("{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
@@ -238,6 +242,26 @@ if (-not $Full -and $layouts.ContainsKey($Layout)) {
 }
 $layouts[$Layout] = $files
 
+# 读取共享里的删除标记（可能还包含上一轮服务端没处理掉的路径）
+$TombstonePath = Join-Path $Base $Tombstone
+$pending = [System.Collections.Generic.HashSet[string]]::new()
+if ([System.IO.File]::Exists($TombstonePath)) {
+    try {
+        $tj = [System.IO.File]::ReadAllText($TombstonePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        if ($tj -is [string]) {
+            if ($tj) { $null = $pending.Add($tj) }
+        }
+        elseif ($null -ne $tj) {
+            foreach ($x in $tj) {
+                if ($x -is [string] -and $x) { $null = $pending.Add($x) }
+            }
+        }
+    }
+    catch {
+        Write-Log ("警告: 读取删除标记失败，按空处理: {0}" -f $_.Exception.Message)
+    }
+}
+
 # ---------- 扫描并发送 ----------
 
 $seen = [System.Collections.Generic.HashSet[string]]::new()
@@ -247,7 +271,7 @@ $srcPrefix = $srcFull + '\'
 
 foreach ($file in Get-FilesRecursive $srcFull) {
     $name = $file.Name
-    if ($name -in @('qm_push.py', 'qm_push.ps1', 'qm_push.command', 'qm_push.cmd', '.DS_Store', 'Thumbs.db') -or
+    if ($name -in @('qm_push.py', 'qm_push.ps1', 'qm_push.command', 'qm_push.cmd', '.DS_Store', 'Thumbs.db', $Tombstone) -or
         $name.StartsWith('._') -or $name.StartsWith('.Trash') -or
         $name.EndsWith('.tmp') -or $name.EndsWith('.part') -or $name.EndsWith('.bmpart')) {
         continue
@@ -256,6 +280,7 @@ foreach ($file in Get-FilesRecursive $srcFull) {
     $total++
     $rel = $file.FullName.Substring($srcPrefix.Length).Replace('\', '/')
     $null = $seen.Add($rel)
+    $null = $pending.Remove($rel)  # 文件又回来了：取消之前的删除
 
     $size = 0
     $mtime = [int64]0
@@ -365,10 +390,52 @@ foreach ($file in Get-FilesRecursive $srcFull) {
     }
 }
 
-# 只清理当前布局里源端已删除的条目；同一客户端其他目录的清单保持不动
-foreach ($key in @($files.Keys)) {
-    if (-not $seen.Contains($key)) {
-        $files.Remove($key)
+# 删除：清单里记过、本次源端没看到的文件 → 写删除标记，服务端下一轮删云端
+$deleted = @($files.Keys | Where-Object { -not $seen.Contains($_) })
+if ($deleted.Count -gt 0) {
+    foreach ($rel in $deleted) {
+        $null = $pending.Add($rel)
+        if ($DryRun) {
+            Write-Log ("[dry-run] 将删除云端 {0}" -f $rel)
+            continue
+        }
+        # 顺手删掉共享里还没上传的副本，免得服务端先传再删
+        $target = Join-Path $Base $rel.Replace('/', '\')
+        Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+    }
+    if ($DryRun) {
+        Write-Log ("检测到 {0} 个文件已删除（dry-run，不写标记）" -f $deleted.Count)
+    }
+    else {
+        Write-Log ("检测到 {0} 个文件已删除，写入删除标记" -f $deleted.Count)
+    }
+}
+
+$markerOk = $true
+if (-not $DryRun) {
+    try {
+        if ($pending.Count -eq 0) {
+            if ([System.IO.File]::Exists($TombstonePath)) {
+                Remove-Item -LiteralPath $TombstonePath -Force
+            }
+        }
+        else {
+            $arr = @($pending | Sort-Object)
+            $json = '[' + (($arr | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join ',') + ']'
+            $tmp = "$TombstonePath.tmp"
+            [System.IO.File]::WriteAllText($tmp, $json, [System.Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $tmp -Destination $TombstonePath -Force
+        }
+    }
+    catch {
+        $markerOk = $false
+        $failed++
+        Write-Log ("错误: 写删除标记失败（{0}）: {1}" -f $TombstonePath, $_.Exception.Message)
+    }
+}
+if ($markerOk) {
+    foreach ($rel in $deleted) {
+        $files.Remove($rel)
     }
 }
 

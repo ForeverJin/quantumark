@@ -134,6 +134,7 @@ pub fn default_excludes() -> Vec<String> {
         "qm_push.ps1",
         "qm_push.command",
         "qm_push.cmd",
+        ".qm-delete",
         ".stfolder",
         ".Trash*",
     ]

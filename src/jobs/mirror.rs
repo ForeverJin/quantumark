@@ -60,6 +60,8 @@ pub async fn run(
     ));
     if scan.files.is_empty() {
         ctx.warn("源目录里没有可备份的文件，本轮结束");
+        // 共享里可能只剩下删除标记；删除是独立动作，不受“空目录不删除”的保护影响
+        process_tombstones(ctx, dest, store, job_id, remote_dir, &scan.tombstones).await?;
         return Ok(());
     }
     ctx.with_stats(|s| s.scanned = scan.files.len() as u64);
@@ -247,6 +249,9 @@ pub async fn run(
         }
     }
 
+    // 8. 处理客户端写的删除标记（本地删除 → 云端删除）
+    process_tombstones(ctx, dest, store, job_id, remote_dir, &scan.tombstones).await?;
+
     Ok(())
 }
 
@@ -377,6 +382,123 @@ fn remove_local(ctx: &RunCtx, opts: &MirrorOptions, root: &Path, f: &LocalFile) 
             Err(e) => ctx.warn(format!("{}: 删除本地文件失败：{e}", f.rel)),
         },
     }
+}
+
+/// 处理客户端写入的删除标记：只删除索引里记录过、且位于本任务远端目录下的路径。
+///
+/// 标记文件由客户端生成（JSON 数组，路径相对标记文件所在目录）。处理成功的标记
+/// 会被删掉；有失败项则保留，下一轮重试（已经删掉的行下次会因索引里没有而跳过）。
+async fn process_tombstones(
+    ctx: &RunCtx,
+    dest: &dyn Destination,
+    store: &Store,
+    job_id: i64,
+    remote_dir: &str,
+    tombstones: &[(PathBuf, String)],
+) -> Result<(), RunAbort> {
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+    // 上传阶段可能刚写过索引，重新读一次，避免漏掉本轮刚上传的文件
+    let index: HashMap<String, FileRow> = store
+        .load_files(job_id)
+        .map_err(RunAbort::Error)?
+        .into_iter()
+        .map(|r| (r.rel.clone(), r))
+        .collect();
+    let policy = ctx.policy().clone();
+    let dir_prefix = format!("{}/", remote_dir.trim_end_matches('/'));
+    let mut streak = 0u32;
+
+    for (path, rel_dir) in tombstones {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                ctx.warn(format!("读取删除标记 {} 失败：{e}", path.display()));
+                continue;
+            }
+        };
+        let rels = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Array(items)) => items
+                .into_iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>(),
+            // 兼容只写了一个路径的旧格式
+            Ok(serde_json::Value::String(s)) => vec![s],
+            _ => {
+                ctx.warn(format!("删除标记格式不对，跳过：{}", path.display()));
+                continue;
+            }
+        };
+
+        let mut failed = false;
+        for rel in rels {
+            let rel = rel.trim();
+            if rel.is_empty() {
+                continue;
+            }
+            if !is_safe_rel(rel) {
+                ctx.warn(format!("删除标记里的路径不合法，跳过：{rel}"));
+                continue;
+            }
+            let full_rel = if rel_dir.is_empty() {
+                rel.to_string()
+            } else {
+                format!("{rel_dir}/{rel}")
+            };
+            let Some(row) = index.get(&full_rel) else {
+                // 索引里没有：从没上传过，或已经被删过，没什么可做
+                continue;
+            };
+            if !row.remote_path.starts_with(&dir_prefix) {
+                ctx.warn(format!(
+                    "{}: 远端路径不在本任务目录下，跳过删除",
+                    row.remote_path
+                ));
+                continue;
+            }
+            ctx.checkpoint()?;
+            match dest.delete(&row.remote_path).await {
+                Ok(()) | Err(DestError::NotFound(_)) => {
+                    store
+                        .delete_file_row(job_id, &full_rel)
+                        .map_err(RunAbort::Error)?;
+                    ctx.with_stats(|s| s.deleted += 1);
+                    ctx.info(format!("按删除标记移除云端 {}", row.remote_path));
+                }
+                Err(e) => {
+                    failed = true;
+                    streak = register_failure(ctx, &full_rel, &e, streak)?;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(policy.delete_gap_ms)).await;
+        }
+
+        if failed {
+            ctx.warn(format!(
+                "删除标记 {} 还有失败项，保留到下一轮",
+                path.display()
+            ));
+        } else {
+            match std::fs::remove_file(path) {
+                Ok(()) => ctx.info(format!("已处理删除标记 {}", path.display())),
+                Err(e) => ctx.warn(format!(
+                    "删除标记 {} 处理完但删不掉：{e}",
+                    path.display()
+                )),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 标记里的路径必须是相对路径，且不能跳出所在目录。
+fn is_safe_rel(rel: &str) -> bool {
+    if rel.starts_with('/') || rel.contains('\\') {
+        return false;
+    }
+    rel.split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// 清理源目录里变空的子目录（不动源目录本身）。
@@ -808,6 +930,96 @@ mod tests {
     fn 非法规则要报错() {
         assert!(compile(&["[".to_string()]).is_err());
         assert!(compile(&["*.mkv".to_string()]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn 删除标记会删掉云端对应文件() {
+        let src = sample_source();
+        let (_sd, store) = test_store().await;
+        let dest = FakeDest::new();
+        let o = opts(src.path().to_str().unwrap());
+        let (ctx, _log) = test_ctx(fast_policy());
+        run(&ctx, &dest, &store, 1, "/115open/backup", &o)
+            .await
+            .unwrap();
+        assert!(dest.exists("/115open/backup/a.txt"));
+
+        // 源端删掉 a.txt，客户端写删除标记
+        std::fs::remove_file(src.path().join("a.txt")).unwrap();
+        std::fs::write(src.path().join(".qm-delete"), r#"["a.txt"]"#).unwrap();
+
+        let (ctx2, _log2) = test_ctx(fast_policy());
+        run(&ctx2, &dest, &store, 1, "/115open/backup", &o)
+            .await
+            .unwrap();
+
+        assert!(!dest.exists("/115open/backup/a.txt"), "云端应删除");
+        assert!(dest.exists("/115open/backup/sub/b.txt"), "别的文件不动");
+        assert!(!src.path().join(".qm-delete").exists(), "标记应被删除");
+        assert!(
+            store
+                .load_files(1)
+                .unwrap()
+                .iter()
+                .all(|r| r.rel != "a.txt"),
+            "索引行应删除"
+        );
+        assert_eq!(ctx2.stats_snapshot().deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn 只有删除标记时也会执行删除() {
+        let src = sample_source();
+        let (_sd, store) = test_store().await;
+        let dest = FakeDest::new();
+        let o = opts(src.path().to_str().unwrap());
+        let (ctx, _log) = test_ctx(fast_policy());
+        run(&ctx, &dest, &store, 1, "/115open/backup", &o)
+            .await
+            .unwrap();
+
+        std::fs::remove_file(src.path().join("a.txt")).unwrap();
+        std::fs::remove_file(src.path().join("sub/b.txt")).unwrap();
+        std::fs::write(src.path().join(".qm-delete"), r#"["a.txt", "sub/b.txt"]"#).unwrap();
+
+        let (ctx2, _log2) = test_ctx(fast_policy());
+        run(&ctx2, &dest, &store, 1, "/115open/backup", &o)
+            .await
+            .unwrap();
+
+        assert!(!dest.exists("/115open/backup/a.txt"));
+        assert!(!dest.exists("/115open/backup/sub/b.txt"));
+        assert!(!src.path().join(".qm-delete").exists());
+        assert_eq!(ctx2.stats_snapshot().deleted, 2);
+    }
+
+    #[tokio::test]
+    async fn 子目录的删除标记与越界路径() {
+        let src = sample_source();
+        let (_sd, store) = test_store().await;
+        let dest = FakeDest::new();
+        let o = opts(src.path().to_str().unwrap());
+        let (ctx, _log) = test_ctx(fast_policy());
+        run(&ctx, &dest, &store, 1, "/115open/backup", &o)
+            .await
+            .unwrap();
+
+        // sub/.qm-delete 里的路径相对 sub；同时混入一个越界路径
+        std::fs::remove_file(src.path().join("sub/b.txt")).unwrap();
+        std::fs::write(
+            src.path().join("sub/.qm-delete"),
+            r#"["b.txt", "../a.txt"]"#,
+        )
+        .unwrap();
+
+        let (ctx2, _log2) = test_ctx(fast_policy());
+        run(&ctx2, &dest, &store, 1, "/115open/backup", &o)
+            .await
+            .unwrap();
+
+        assert!(!dest.exists("/115open/backup/sub/b.txt"), "子目录标记应生效");
+        assert!(dest.exists("/115open/backup/a.txt"), "越界路径不能删");
+        assert!(!src.path().join("sub/.qm-delete").exists());
     }
 
     #[test]

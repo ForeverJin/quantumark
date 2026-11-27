@@ -21,6 +21,12 @@ use crate::destination::{DestError, Destination, join_path, split_path};
 use crate::model::{FileRow, Policy, RunStats};
 use crate::store::{Store, now};
 
+/// 客户端写入的删除标记文件名（JSON 数组，路径相对于标记文件所在目录）。
+///
+/// 客户端把“已发送过、但源端已删除”的路径写进这个文件；镜像任务处理完会删掉它。
+/// 扫描时单独收集，绝不上传。
+pub const TOMBSTONE_NAME: &str = ".qm-delete";
+
 /// 运行中止的原因。
 #[derive(Debug, Clone)]
 pub enum RunAbort {
@@ -170,6 +176,8 @@ pub struct ScanResult {
     pub skipped_symlinks: u64,
     pub skipped_excluded: u64,
     pub unreadable: u64,
+    /// 删除标记文件：(绝对路径, 所在目录相对源根的路径)
+    pub tombstones: Vec<(PathBuf, String)>,
 }
 
 /// 递归扫描源目录。
@@ -226,6 +234,11 @@ pub fn scan_local(
             };
             if meta.file_type().is_symlink() {
                 out.skipped_symlinks += 1;
+                continue;
+            }
+            // 删除标记单独收集，绝不作为普通文件上传
+            if meta.is_file() && name == TOMBSTONE_NAME {
+                out.tombstones.push((abs.clone(), rel_dir.clone()));
                 continue;
             }
             if exclude.is_match(&rel) || exclude.is_match(&name) {
