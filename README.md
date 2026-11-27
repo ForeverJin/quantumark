@@ -217,6 +217,8 @@ docker compose exec quantumark /usr/local/bin/quantumark --set-password 新密�
   删除本地要求源目录是**可写挂载**（`docker-compose.yml` 里的 `QM_UPLOAD_DIR` → `/upload`），
   只读挂载下删除会失败并在日志里告警，不会假装成功。
 - 源目录为空时**不会**执行同步删除（防止挂载失败把云端清空）。
+- 多台设备汇总备份（客户端经 SMB 投递到 Armbian，再由一个镜像任务上传）见
+  「[多设备推送（SMB 中转）](#多设备推送smb-中转)」。
 
 ### 目录归档
 
@@ -244,6 +246,140 @@ docker compose exec quantumark /usr/local/bin/quantumark --set-password 新密�
 - **一致性**：数据库运行中拷贝可能不一致。程序会检测 `*.sock`/`*.pid` 并告警，但不会替你停库——
   建议停库或用文件系统快照。一般优先用①
 - 默认排除临时文件：`ibtmp1`、`#innodb_temp`、`*.pid`、`*.sock`、`*.err`；redo/binlog 不排除
+
+## 多设备推送（SMB 中转）
+
+多台电脑各自要备份一个目录时，不必给每台建任务：让它们把文件推进 Armbian 的 SMB 共享，
+quantumark 用一个镜像任务上传到 115，上传成功后把共享里的文件删掉。共享目录就是投递队列，
+服务端只认一个可写的投递目录（下面以 `/upload` 为例；已有部署也可能挂成 `/backuphub`
+之类的路径，以 `docker inspect` 里的挂载为准）。
+
+```text
+Linux / macOS / Windows ──SMB 推送──> Armbian:/srv/smb/quantumark-inbox
+                                             │
+                                     镜像任务（源 /upload）
+                                             │
+                                           115
+```
+
+### 服务端
+
+1. 建一个**专用**投递目录（不要用现有共享的根目录——上传成功的文件会被删掉）：
+
+   ```bash
+   sudo mkdir -p /srv/smb/quantumark-inbox
+   sudo chown -R 1000:1000 /srv/smb/quantumark-inbox   # 与 QM_UID/QM_GID 一致
+   ```
+
+   一定要先建目录再启动容器：Docker 发现 bind 源不存在时会用 root 建一个空目录，
+   容器里的 uid 1000 就删不掉文件。
+
+2. Samba 导出它，并让写入的文件属主/权限和容器用户一致，否则容器能读不能删：
+
+   ```ini
+   [quantumark-inbox]
+      path = /srv/smb/quantumark-inbox
+      read only = no
+      force user = qm          # uid 1000，与 QM_UID 一致
+      create mask = 0644
+      directory mask = 0775
+   ```
+
+3. `.env` 里把可写收件箱指过去，然后重建容器（`docker-compose.yml` 本身不用改）：
+
+   ```bash
+   # .env
+   QM_UPLOAD_DIR=/srv/smb/quantumark-inbox
+   ```
+
+   ```bash
+   docker compose up -d          # 没生效就加 --force-recreate
+   docker compose config | grep -A1 upload   # 复核挂载
+   ```
+
+4. 新建**目录镜像**任务：
+
+   - 源目录填**可写挂载点**（不是 `/host/...`，那边只读，删不掉文件）。本仓库 compose 默认是
+     `/upload`；已有部署可能额外挂成 `/backuphub` 之类，用 `docker inspect` 看实际挂载名
+   - 远端目录例如 `/backup/inbox`
+   - 打开「上传后删除本地」，关闭「同步删除」，回收目录留空
+   - 保留默认排除规则（含 `*.part`/`*.tmp`）；如果客户端脚本或日志放在源目录里，把名字补进排除
+   - 调度建议 1–2 小时一次或凌晨多次：投递目录为空时任务几秒就结束，多跑没有额外开销
+
+### 客户端
+
+仓库里的 `scripts/client-push/` 提供两个脚本：只发送新增/变化的文件，先写 `xxx.part` 再
+rename 成正式名，并保留源文件 mtime。**脚本、日志、SMB 凭据都不要放在被备份的目录里**
+（会被一起传上 115）。
+
+默认保留源目录名，一台设备一层客户端目录：
+
+```text
+--src /data/photos --client laptop  ->  <dest>/laptop/photos/<相对路径>
+--flat                              ->  <dest>/laptop/<相对路径>
+--subdir 2026/photos                ->  <dest>/laptop/2026/photos/<相对路径>
+```
+
+同一客户端可以推多个目录，清单按“布局”（客户端 + 子目录）分别记录；改了 `--src` 的目录名
+或 `--subdir` 会被当成新布局，重新全量发送一次。
+
+Linux / macOS（需要 Python 3，无第三方依赖）：
+
+```bash
+python3 qm_push.py --src /data/photos --dest /mnt/quantumark-inbox --client laptop-jin
+python3 qm_push.py --src /data/photos --dest /mnt/quantumark-inbox --client laptop-jin --dry-run
+python3 qm_push.py --src /data/photos --dest /mnt/quantumark-inbox --client laptop-jin --flat
+```
+
+已发送清单默认在 `~/.local/state/quantumark-push/<client>.json`，可用 `--state-dir` 改；
+`--full` 强制重发当前布局。挂载共享可以用 `mount -t cifs`（Linux）或 Finder / `mount_smbfs`
+（macOS），凭据放在系统钥匙串或 credentials 文件里。
+
+Windows：
+
+```powershell
+.\qm_push.ps1 -Source D:\photos -Dest \\armbian\quantumark-inbox -Client mypc
+.\qm_push.ps1 -Source D:\photos -Dest \\armbian\quantumark-inbox -Client mypc -Subdir 2026\photos
+```
+
+清单默认在 `%LOCALAPPDATA%\quantumark-push`；用 SYSTEM 跑计划任务时加
+`-StateDir C:\ProgramData\quantumark-push`。用 UNC 路径前先让运行账户能访问共享（`net use`
+或凭据管理器）。脚本头部注释里有 `schtasks` 示例。
+
+脚本本身也放了一份到共享的设备目录（`<dest>/Mac/`、`<dest>/PC/`）。用的时候直接复制到
+需要备份的根目录，例如：
+
+```bash
+# macOS
+cp /Volumes/BackupHub/Mac/qm_push.py /Users/mrqiang/stm32/
+cd /Users/mrqiang/stm32
+python3 qm_push.py --src . --dest /Volumes/BackupHub --client Mac
+```
+
+脚本放在源目录里没关系：默认排除规则会跳过 `qm_push.py` / `qm_push.ps1`，任务既不会把它
+传上 115，也不会在清理本地时删掉它；客户端还会把它复制一份到 `<client>/<目录名>/` 下，
+方便下次直接从共享里取。**不要改脚本名**，或者把新名字同步加进排除规则。
+
+定时任务示例（客户端先推，服务端任务晚一点跑；两者重叠也不会传半截文件）：
+
+```cron
+10 2 * * * /usr/bin/python3 /opt/quantumark/qm_push.py --src /data/photos --dest /mnt/inbox --client laptop-jin
+```
+
+### 注意
+
+- **投递目录是队列，不是存储**：上传成功就会被删，不要手工清理或搬动；客户端源目录才是权威。
+- **删除不联动**：客户端删掉文件，不会删 115 上的旧副本（同步删除默认关）。
+- **115 上每个路径只保留最新一份**，不保留历史版本；要历史用目录归档任务。
+- 变化判断是大小 + mtime，客户端必须保留 mtime（脚本已经处理）；用别的工具推送时注意。
+- 服务端删除本地前会再 stat 一次，任务运行期间客户端换上的新版本会留到下一轮；但同大小、
+  同 mtime 的内容替换识别不了（见「已知限制」）。
+- 以 `.tmp` / `.part` 结尾的真实文件会被默认排除规则跳过，尽量别用这种名字；macOS 的
+  `._*` 元数据文件和 `.DS_Store` 也在默认排除里。
+- 客户端脚本 `qm_push.py` / `qm_push.ps1` 在默认排除里：放在源目录不会上传、也不会被删；
+  改了脚本名就要同步把新名字加进排除规则。
+- 客户端子目录在上传清空后会被清理掉（空目录不保留），脚本每次写入前都会重建，属正常现象。
+- 投递目录要留够磁盘：每轮任务之间新增的数据都先落在 Armbian 上。
 
 ## 恢复（手动）
 
@@ -369,6 +505,9 @@ arm64 的编译阶段在构建机上交叉完成，但 runtime 阶段安装 `mar
 
 - 单实例部署，任务全局串行（这是刻意的：115 的配额不适合并发）
 - **不做内容校验**：上传后只核对大小，不计算 SHA1；首次认领也按大小认领，同名同大小但内容不同的文件不会被发现
+- **上传后删除本地**（SMB 中转）只能按大小/mtime 判断，删除前会复核一次；客户端必须保留 mtime
+- SMB 中转时目标目录会被清空，普通 rsync 增量不适用，客户端需自备“已发送清单”（见「多设备推送」）
+- 镜像任务在 115 上每个路径只保留最新版本；需要历史版本用目录归档任务
 - 单个大文件失败后从头重传（暂不支持断点续传）
 - MySQL 数据目录只做文件级拷贝，不保证运行中拷贝的一致性（见上文）
 - 恢复是手动的（后续版本再加界面）

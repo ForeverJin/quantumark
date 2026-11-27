@@ -1064,7 +1064,7 @@ const actions = {
       destination_id: S.dests.length ? S.dests[0].id : '',
       remote_dir: S.dests.length ? S.dests[0].root + '/backup' : '',
       cron: '', keep: null, has_secret: false,
-      options: { source: '', include: [], exclude: ['@eaDir', '.DS_Store', 'Thumbs.db', '*.tmp'], sync_delete: false, delete_local: false, local_trash: null },
+      options: { source: '', include: [], exclude: ['@eaDir', '#recycle', '.DS_Store', 'Thumbs.db', '._*', '*.tmp', '*.part', '*.bmpart', 'qm_push.py', 'qm_push.ps1', '.stfolder', '.Trash*'], sync_delete: false, delete_local: false, local_trash: null },
     };
     S.error = null;
     S.ageKey = null;

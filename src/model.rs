@@ -126,9 +126,12 @@ pub fn default_excludes() -> Vec<String> {
         "#recycle",
         ".DS_Store",
         "Thumbs.db",
+        "._*",
         "*.tmp",
         "*.part",
         "*.bmpart",
+        "qm_push.py",
+        "qm_push.ps1",
         ".stfolder",
         ".Trash*",
     ]

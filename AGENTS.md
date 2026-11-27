@@ -44,6 +44,7 @@ src/runner.rs          全局串行的执行器：运行记录、冷却、取消
 src/scheduler.rs       cron 调度、错过补跑
 src/web/               axum 路由、会话鉴权、JSON 接口、内嵌界面（ui/）
 proto/clouddrive.proto CD2 官方 proto（与 Full-Stack-Media-Library 里的逐字节相同）
+scripts/client-push/   客户端推送脚本（Linux/macOS 的 Python、Windows 的 PowerShell，不进镜像）
 ```
 
 界面是 `src/web/mod.rs` 用 `include_str!` 内嵌的纯静态文件（`src/web/ui/index.html`、

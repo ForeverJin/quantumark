@@ -310,8 +310,29 @@ pub async fn preview(
     })
 }
 
+/// 删除本地文件前复核：扫描之后这个文件没有被写端替换过。
+///
+/// “上传后删除本地”常配合投递目录（SMB 中转）：客户端可能在“扫描 → 上传 → 删本地”
+/// 之间把新版本 rename 到位。这时删掉会把新版本丢掉，而索引记录的还是旧版本，
+/// 客户端清单又认为已发送，云端就停在旧内容上。所以删除前必须再 stat 一次。
+fn local_still_matches(f: &LocalFile) -> bool {
+    match std::fs::symlink_metadata(&f.abs) {
+        Ok(meta) => {
+            meta.is_file() && meta.len() as i64 == f.size && super::mtime_ns(&meta) == f.mtime_ns
+        }
+        Err(_) => false,
+    }
+}
+
 /// 删除（或移到回收目录）一个已确认在云端的本地文件。
 fn remove_local(ctx: &RunCtx, opts: &MirrorOptions, root: &Path, f: &LocalFile) {
+    if !local_still_matches(f) {
+        ctx.warn(format!(
+            "{}: 扫描后已被修改或已不存在，保留本地文件，下一轮再处理",
+            f.rel
+        ));
+        return;
+    }
     let path = Path::new(&f.abs);
     let root_real = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let file_real = match path.canonicalize() {
@@ -787,5 +808,47 @@ mod tests {
     fn 非法规则要报错() {
         assert!(compile(&["[".to_string()]).is_err());
         assert!(compile(&["*.mkv".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn 删除前复核文件是否仍与扫描一致() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"aaa").unwrap();
+
+        let make = |p: &Path| {
+            let meta = std::fs::metadata(p).unwrap();
+            LocalFile {
+                rel: "a.txt".to_string(),
+                size: meta.len() as i64,
+                mtime_ns: crate::jobs::mtime_ns(&meta),
+                abs: p.to_string_lossy().to_string(),
+            }
+        };
+
+        let f = make(&path);
+        assert!(local_still_matches(&f), "刚写入的文件应一致");
+
+        // 大小变了：删掉会把客户端刚换上的新版本弄丢
+        std::fs::write(&path, b"aaaa").unwrap();
+        assert!(!local_still_matches(&f));
+
+        // 大小相同但 mtime 变了
+        std::fs::write(&path, b"bbb").unwrap();
+        let f2 = make(&path);
+        assert!(local_still_matches(&f2));
+        let times = std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        assert!(!local_still_matches(&f2), "mtime 变了不能删");
+
+        // 文件已经不存在
+        std::fs::remove_file(&path).unwrap();
+        assert!(!local_still_matches(&f2));
     }
 }
