@@ -6,10 +6,11 @@
   服务端上传成功后会删掉投递目录里的文件，所以目标目录不能当作“远端状态”做
   robocopy /MIR 之类的镜像。本脚本在本机保存一份“已发送清单”（路径 → 大小 +
   mtime），每次只发送新增/变化的文件，并保证写入是原子的：
-      先写 <文件名>.part -> 刷新到盘 -> rename 成正式名
+      先写 <文件名>.part -> rename 成正式名
   这样服务端任何时刻扫描到的都是完整文件；`.part` 也会被服务端的默认排除规则跳过。
+  默认不逐文件强制落盘（Flush），在 SMB 上每个 flush 都是一次同步往返；需要严格
+  落盘时加 -Fsync。脚本自身、.DS_Store、._*、*.tmp/*.part 等会直接跳过。
 
-  脚本自己、日志、SMB 凭据不要放在 -Source 里，否则会被一起备份到 115。
   目标目录是队列，不是存储：服务端上传成功后会删掉文件，不要手工清理。
 
   只按大小 + mtime 判断变化；脚本会保留源文件的 LastWriteTimeUtc。
@@ -19,8 +20,12 @@
     -Source D:\photos -Client mypc        ->  <Dest>\mypc\photos\<相对路径>
     -Flat                                 ->  <Dest>\mypc\<相对路径>
     -Subdir 2026\photos                   ->  <Dest>\mypc\2026\photos\<相对路径>
-  改了 -Source / -Client / -Subdir 会被当成新的布局、重新全量发送一次；
-  同一客户端可以推多个目录，清单按布局分别记录。
+  改了 -Source / -Dest / -Client / -Subdir 会被当成新目标、重新全量发送一次；
+  同一客户端可以推多个目录，清单按“目标 + 布局”分别记录。
+
+  第一次想用资源管理器粘贴省时间：先把整棵树粘到 <Dest>\<Client>\<目录名>\，再跑
+  一次脚本（首次运行会自动认领，也可以显式加 -Adopt）。大小 + mtime（1 秒容差）
+  一致的文件直接记入清单，不会重抄；之后正常增量。
 
 .EXAMPLE
   .\qm_push.ps1 -Source D:\photos -Dest \\armbian\quantumark-inbox -Client mypc
@@ -30,6 +35,9 @@
 
 .EXAMPLE
   .\qm_push.ps1 -Source D:\photos -Dest Z:\ -Client mypc -Subdir 2026\photos
+
+.EXAMPLE
+  .\qm_push.ps1 -Source D:\photos -Dest Z:\ -Client mypc -Adopt
 
 .NOTES
   定时推送（任务计划程序，每天 02:10；SYSTEM 运行时用 ProgramData 存清单）：
@@ -46,14 +54,16 @@ param(
     [string]$Client = $env:COMPUTERNAME,
     [string]$Subdir,
     [switch]$Flat,
+    [switch]$Adopt,
     [string]$StateDir = (Join-Path $env:LOCALAPPDATA "quantumark-push"),
     [switch]$Full,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Fsync
 )
 
 $ErrorActionPreference = "Stop"
 $ManifestVersion = 2
-$ChunkSize = 1MB
+$ChunkSize = 4MB
 $SaveEvery = 20
 
 function Write-Log([string]$Message) {
@@ -87,7 +97,9 @@ function Get-FilesRecursive([string]$Root) {
                     continue
                 }
                 if ($entry -is [System.IO.DirectoryInfo]) {
-                    $stack.Push($entry.FullName)
+                    if ($entry.Name -notin @('@eaDir', '#recycle', '.stfolder')) {
+                        $stack.Push($entry.FullName)
+                    }
                 }
                 elseif ($entry -is [System.IO.FileInfo]) {
                     $entry
@@ -146,6 +158,9 @@ $srcFull = $Source.TrimEnd('\')
 if ($Flat -and -not [string]::IsNullOrEmpty($Subdir)) {
     Stop-Fatal "-Subdir 和 -Flat 不能同时使用"
 }
+if ($Full -and $Adopt) {
+    Stop-Fatal "-Full 和 -Adopt 不能同时使用"
+}
 if ($Flat) {
     $Subdir = ""
 }
@@ -168,7 +183,7 @@ if ($destFull.Equals($srcFull, [System.StringComparison]::OrdinalIgnoreCase) -or
     Stop-Fatal "投递目录不能位于源目录里面"
 }
 
-$Layout = if ($Subdir) { "$Client/$Subdir" } else { $Client }
+$Layout = if ($Subdir) { "{0}::{1}/{2}" -f $destFull, $Client, $Subdir } else { "{0}::{1}" -f $destFull, $Client }
 $Base = Join-Path $Dest $Client
 if ($Subdir) {
     $Base = Join-Path $Base ($Subdir.Replace('/', '\'))
@@ -179,7 +194,7 @@ try {
 catch {
     Stop-Fatal "投递目录不可写（检查共享权限）: $Base : $($_.Exception.Message)"
 }
-Write-Log ("目标布局：{0}" -f $Base)
+Write-Log ("目标目录：{0}" -f $Base)
 
 if (-not [System.IO.Directory]::Exists($StateDir)) {
     try { [System.IO.Directory]::CreateDirectory($StateDir) | Out-Null }
@@ -212,6 +227,11 @@ if ([System.IO.File]::Exists($ManifestPath)) {
         $layouts = @{}
     }
 }
+$FirstForLayout = -not $layouts.ContainsKey($Layout)
+$AdoptMode = $Adopt -or ($FirstForLayout -and -not $Full)
+if ($AdoptMode) {
+    Write-Log "先检查目标里已有的文件（大小 + mtime 一致就认领，不重复复制）"
+}
 $files = @{}
 if (-not $Full -and $layouts.ContainsKey($Layout)) {
     $files = $layouts[$Layout]
@@ -221,11 +241,18 @@ $layouts[$Layout] = $files
 # ---------- 扫描并发送 ----------
 
 $seen = [System.Collections.Generic.HashSet[string]]::new()
-$total = 0; $sent = 0; $skipped = 0; $failed = 0
+$total = 0; $sent = 0; $skipped = 0; $adopted = 0; $adoptedFixed = 0; $failed = 0
 $sentBytes = [int64]0
 $srcPrefix = $srcFull + '\'
 
 foreach ($file in Get-FilesRecursive $srcFull) {
+    $name = $file.Name
+    if ($name -in @('qm_push.py', 'qm_push.ps1', 'qm_push.command', 'qm_push.cmd', '.DS_Store', 'Thumbs.db') -or
+        $name.StartsWith('._') -or $name.StartsWith('.Trash') -or
+        $name.EndsWith('.tmp') -or $name.EndsWith('.part') -or $name.EndsWith('.bmpart')) {
+        continue
+    }
+
     $total++
     $rel = $file.FullName.Substring($srcPrefix.Length).Replace('\', '/')
     $null = $seen.Add($rel)
@@ -242,10 +269,51 @@ foreach ($file in Get-FilesRecursive $srcFull) {
         continue
     }
 
-    $prev = $files[$rel]
-    if (-not $Full -and $null -ne $prev -and $prev.size -eq $size -and $prev.mtime -eq $mtime) {
-        $skipped++
-        continue
+    $target = Join-Path $Base $rel.Replace('/', '\')
+    if ($AdoptMode) {
+        $exact = $false
+        $bySize = $false
+        try {
+            $dst = [System.IO.FileInfo]::new($target)
+            if ($dst.Exists -and $dst.Length -eq $size) {
+                if ([Math]::Abs($dst.LastWriteTimeUtc.Ticks - $mtime) -le [System.TimeSpan]::TicksPerSecond) {
+                    $exact = $true
+                }
+                else {
+                    $bySize = $true
+                }
+            }
+        }
+        catch { }
+        if ($exact -or $bySize) {
+            if ($bySize) {
+                if ($DryRun) {
+                    Write-Log ("[dry-run] 认领 {0}（按大小，mtime 会校正）" -f $rel)
+                }
+                else {
+                    try {
+                        [System.IO.File]::SetLastWriteTimeUtc($target, $file.LastWriteTimeUtc)
+                        $adoptedFixed++
+                    }
+                    catch {
+                        Write-Log ("警告: {0} 认领后校正 mtime 失败: {1}" -f $rel, $_.Exception.Message)
+                    }
+                }
+            }
+            elseif ($DryRun) {
+                Write-Log ("[dry-run] 认领 {0}" -f $rel)
+            }
+            $files[$rel] = @{ size = $size; mtime = $mtime }
+            $adopted++
+            continue
+        }
+    }
+    else {
+        $prev = $files[$rel]
+        if (-not $Full -and $null -ne $prev -and $prev.size -eq $size -and $prev.mtime -eq $mtime) {
+            $skipped++
+            continue
+        }
     }
 
     if ($DryRun) {
@@ -255,7 +323,6 @@ foreach ($file in Get-FilesRecursive $srcFull) {
         continue
     }
 
-    $target = Join-Path $Base $rel.Replace('/', '\')
     $part = "$target.part"
     try {
         [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target)) | Out-Null
@@ -268,7 +335,7 @@ foreach ($file in Get-FilesRecursive $srcFull) {
                 while (($n = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
                     $out.Write($buffer, 0, $n)
                 }
-                $out.Flush($true)
+                if ($Fsync) { $out.Flush($true) }
             }
             finally { $out.Dispose() }
         }
@@ -313,6 +380,6 @@ if (-not $DryRun) {
     }
 }
 
-Write-Log ("完成：扫描 {0}，发送 {1}（{2} 字节），未变化 {3}，失败 {4}" -f $total, $sent, $sentBytes, $skipped, $failed)
+Write-Log ("完成：扫描 {0}，发送 {1}（{2} 字节），认领 {3}（校正 mtime {4}），未变化 {5}，失败 {6}" -f $total, $sent, $sentBytes, $adopted, $adoptedFixed, $skipped, $failed)
 if ($failed -gt 0) { exit 1 }
 exit 0

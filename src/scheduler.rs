@@ -2,7 +2,8 @@
 //
 // 语义：
 //   - 每个任务一条 5 段 cron（内部补上秒位），时区跟随 TZ。
-//   - 启动时如果发现 24 小时内错过了一次，补跑一次。
+//   - 启动/改表达式时，如果“停机补跑窗口”内错过了一次，补跑一次；窗口由策略配置
+//     （misfire_window_s，默认 24 小时，设为 0 表示不补跑）。
 //   - 同一任务不会重叠（交给 Runner 的 active 集合判断）。
 //   - 风控冷却期内跳过定时触发（Runner 里再判一次）。
 
@@ -18,8 +19,6 @@ use crate::runner::{Runner, get_cooldown};
 use crate::store::{Store, now};
 
 const TICK: Duration = Duration::from_secs(30);
-/// 补跑窗口：24 小时
-const CATCH_UP: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 
 struct JobSchedule {
     expr: String,
@@ -43,6 +42,10 @@ pub fn spawn(runner: Runner, store: Arc<Store>) -> tokio::task::JoinHandle<()> {
                 }
             };
             let now_local = Local::now();
+            // 补跑窗口可配置；设成 0 表示重启/改表达式后不自动补跑
+            let misfire = chrono::TimeDelta::seconds(
+                store.policy().misfire_window_s.min(31_536_000) as i64,
+            );
 
             // 清理已删除/已停用任务的调度状态
             let alive: Vec<i64> = jobs.iter().map(|j| j.id).collect();
@@ -67,7 +70,7 @@ pub fn spawn(runner: Runner, store: Arc<Store>) -> tokio::task::JoinHandle<()> {
                     Some(s) if s.expr == expr => s,
                     _ => {
                         // 首次见到或表达式变了：确定下一次触发时间
-                        let next_due = initial_due(&schedule, now_local);
+                        let next_due = initial_due(&schedule, now_local, misfire);
                         states.insert(
                             job.id,
                             JobSchedule {
@@ -180,10 +183,14 @@ fn next_after(schedule: &Schedule, from: DateTime<Local>) -> DateTime<Local> {
 }
 
 /// 首次计划时间：
-///   - 24 小时内有错过的触发点 → 立刻补跑一次（返回 now）
+///   - 补跑窗口内有错过的触发点 → 立刻补跑一次（返回 now）
 ///   - 否则 → 下一个未来的触发点
-fn initial_due(schedule: &Schedule, now_local: DateTime<Local>) -> DateTime<Local> {
-    let window_start = now_local - CATCH_UP;
+fn initial_due(
+    schedule: &Schedule,
+    now_local: DateTime<Local>,
+    window: chrono::TimeDelta,
+) -> DateTime<Local> {
+    let window_start = now_local - window;
     let mut last: Option<DateTime<Local>> = None;
     for t in schedule.after(&window_start) {
         if t > now_local {
@@ -240,8 +247,16 @@ mod tests {
     fn 错过的任务会立刻补跑() {
         let schedule = parse("* * * * *").unwrap(); // 每分钟
         let now = Local::now();
-        let due = initial_due(&schedule, now);
+        let due = initial_due(&schedule, now, chrono::TimeDelta::hours(24));
         assert_eq!(due, now);
+    }
+
+    #[test]
+    fn 补跑窗口为0时不补跑() {
+        let schedule = parse("* * * * *").unwrap();
+        let now = Local::now();
+        let due = initial_due(&schedule, now, chrono::TimeDelta::zero());
+        assert!(due > now);
     }
 
     #[test]
@@ -249,7 +264,7 @@ mod tests {
         // 选一个未来几十年不会命中的时间组合：2 月 30 日不存在 → 用 2 月 29 日
         let schedule = parse("0 3 29 2 *").unwrap();
         let now = Local::now();
-        let due = initial_due(&schedule, now);
+        let due = initial_due(&schedule, now, chrono::TimeDelta::hours(24));
         assert!(due > now);
     }
 }
